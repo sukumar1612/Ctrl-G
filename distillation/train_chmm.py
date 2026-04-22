@@ -1,21 +1,87 @@
-"""Train a CHMM distilled from sampled LLM outputs.
-
-This script mirrors the existing `train_hmm.py` workflow but uses a
-large-vocabulary CHMM with a configurable clone schedule.
-"""
-
 from __future__ import annotations
 
 import argparse
+import importlib.util
+import inspect
 import json
 import os
-import time
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
-from chmm import CHMM, build_clone_schedule, rank_tokens_from_counts
+from chmm import CHMM, collect_pair_codes_from_sequences
+
+
+def dist_is_enabled() -> bool:
+    return dist.is_available() and dist.is_initialized()
+
+
+def dist_barrier() -> None:
+    if dist_is_enabled():
+        dist.barrier()
+
+
+def dist_all_reduce(tensor: torch.Tensor) -> None:
+    if dist_is_enabled():
+        dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+
+
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def shard_rows(seqs: torch.Tensor, rank: int, world_size: int) -> torch.Tensor:
+    if world_size <= 1:
+        return seqs
+
+    n = int(seqs.shape[0])
+    rows_per_rank = ceil_div(n, world_size)
+    start = rank * rows_per_rank
+    end = min(n, start + rows_per_rank)
+    if start >= n:
+        return seqs[:0]
+    return seqs[start:end]
+
+
+def model_scalar_zeros(model: CHMM) -> torch.Tensor:
+    param = next(iter(model.parameters()), None)
+    if param is not None:
+        return torch.zeros((), dtype=param.dtype, device=param.device)
+
+    buf = next(iter(model.buffers()), None)
+    if buf is not None:
+        return torch.zeros((), dtype=buf.dtype, device=buf.device)
+
+    return torch.zeros((), dtype=torch.float32, device="cpu")
+
+
+def compute_loglikelihood(
+    model: CHMM,
+    data: torch.Tensor,
+    batch_size: int,
+) -> torch.Tensor:
+    if data.shape[0] == 0:
+        return model_scalar_zeros(model)
+    return model.loglikelihood(data, batch_size)
+
+
+def apply_dropout(
+    input_ids: torch.Tensor,
+    dropout: float,
+    vocab_size: int,
+    eos_token_id: int,
+) -> torch.Tensor:
+    del vocab_size
+    if dropout <= 0.0:
+        return input_ids
+
+    n, d = input_ids.shape
+    input_ids[torch.rand(n, device=input_ids.device) < dropout, -1] = eos_token_id
+    random_mask = torch.rand(n, d, device=input_ids.device) < dropout
+    input_ids[torch.logical_and(random_mask, input_ids != eos_token_id)] = -1
+    return input_ids
 
 
 def parse_args() -> argparse.Namespace:
@@ -23,40 +89,43 @@ def parse_args() -> argparse.Namespace:
 
     parser.add_argument("--model_path", required=True, type=str)
     parser.add_argument("--checkpoint", default=0, type=int)
-    parser.add_argument("--save_per_step", default=1, type=int)
-    parser.add_argument("--init_only", action="store_true")
+    parser.add_argument("--save_per_step", default=10, type=int)
 
     parser.add_argument("--data_path", required=True, type=str)
     parser.add_argument("--dataset", required=True, type=str)
-    parser.add_argument("--dev_file", default="", type=str)
     parser.add_argument("--total_chunks", required=True, type=int)
+    parser.add_argument("--batch_size", default=256, type=int)
     parser.add_argument("--sample_length", default=None, type=int)
+    parser.add_argument("--em_schedule", required=True, type=str)
 
-    parser.add_argument("--tokenizer_name_or_path", default="", type=str)
     parser.add_argument("--vocab_size", default=None, type=int)
     parser.add_argument("--eos_token_id", default=None, type=int)
+    parser.add_argument("--tokenizer_name_or_path", default="", type=str)
 
-    parser.add_argument("--batch_size", default=2048, type=int)
-    parser.add_argument("--train_eval_size", default=8192, type=int)
-    parser.add_argument("--max_train_batches", default=None, type=int)
-    parser.add_argument("--max_dev_batches", default=None, type=int)
+    parser.add_argument("--clone_schedule_file", default="", type=str)
+    parser.add_argument(
+        "--clone_schedule_function",
+        default="",
+        type=str,
+        help=(
+            "Optional custom clone schedule builder as path:function_name. "
+            "The path can point to a .py file or a .ipynb notebook."
+        ),
+    )
+    parser.add_argument("--pair_code_chunk_count", default=0, type=int)
 
-    parser.add_argument("--em_schedule", default="", type=str)
-    parser.add_argument("--init_chunk_count", default=4, type=int)
-    parser.add_argument("--init_context", default="both", choices=["prev", "next", "both"])
-
-    parser.add_argument("--clone_top4", default=64, type=int)
-    parser.add_argument("--clone_top2", default=256, type=int)
-
-    parser.add_argument("--storage_dtype", default="bfloat16", type=str)
-    parser.add_argument("--pseudocount", default=1e-3, type=float)
-    parser.add_argument("--clone_pseudocount", default=None, type=float)
-    parser.add_argument("--initial_pseudocount", default=None, type=float)
-    parser.add_argument("--online_count_decay", default=0.0, type=float)
-    parser.add_argument("--row_chunk_size", default=512, type=int)
-    parser.add_argument("--device", default="cuda", type=str)
-
+    parser.add_argument("--dropout", default=0.0, type=float)
+    parser.add_argument(
+        "--pseudocount",
+        default=0.001,
+        type=float,
+        help="Per clone-to-clone transition kappa for paper-style pseudocount smoothing.",
+    )
     parser.add_argument("--log_file", default="", type=str)
+
+    parser.add_argument("--disable_mmap", action="store_true")
+    parser.add_argument("--disable_pin_memory", action="store_true")
+    parser.add_argument("--disable_tf32", action="store_true")
 
     return parser.parse_args()
 
@@ -67,8 +136,7 @@ def resolve_vocab_and_eos(args: argparse.Namespace) -> tuple[int, int]:
 
     if not args.tokenizer_name_or_path:
         raise ValueError(
-            "Provide either (--vocab_size and --eos_token_id) or "
-            "--tokenizer_name_or_path."
+            "Provide (--vocab_size and --eos_token_id) or --tokenizer_name_or_path."
         )
 
     from transformers import AutoTokenizer
@@ -77,9 +145,13 @@ def resolve_vocab_and_eos(args: argparse.Namespace) -> tuple[int, int]:
     return int(tokenizer.vocab_size), int(tokenizer.eos_token_id)
 
 
-def parse_em_schedule(schedule: str, total_chunks: int) -> list[tuple[int, int]]:
-    if not schedule:
-        return [(1, total_chunks)]
+def chunk_file(data_path: str, dataset: str, chunk_idx: int, total_chunks: int) -> str:
+    if total_chunks == 1:
+        return f"{data_path}/{dataset}.train"
+    return f"{data_path}/{dataset}.train.{chunk_idx}"
+
+
+def parse_em_schedule(schedule: str) -> list[tuple[int, int]]:
     return [
         tuple(int(y) for y in item.split(","))
         for item in schedule.split(";")
@@ -87,358 +159,469 @@ def parse_em_schedule(schedule: str, total_chunks: int) -> list[tuple[int, int]]
     ]
 
 
-def chunk_file(data_path: str, dataset: str, chunk_id: int, total_chunks: int) -> str:
-    if total_chunks == 1:
-        return f"{data_path}/{dataset}.train"
-    return f"{data_path}/{dataset}.train.{chunk_id}"
+def load_sequences(
+    path: str,
+    sample_length: int | None,
+    *,
+    mmap: bool = False,
+) -> torch.Tensor:
+    load_kwargs: dict[str, object] = {
+        "map_location": "cpu",
+        "weights_only": True,
+    }
+    if mmap:
+        load_kwargs["mmap"] = True
 
+    try:
+        seqs = torch.load(path, **load_kwargs).long()
+    except TypeError:
+        load_kwargs.pop("mmap", None)
+        seqs = torch.load(path, **load_kwargs).long()
 
-def load_sequences(path: str, sample_length: int | None) -> torch.Tensor:
-    seqs = torch.load(path, map_location="cpu", weights_only=True).long()
     if sample_length is not None:
         seqs = seqs[:, :sample_length]
     return seqs.contiguous()
 
 
-def trim_lengths(input_ids: torch.Tensor, eos_token_id: int) -> torch.Tensor:
-    eos_mask = input_ids.eq(eos_token_id)
-    has_eos = eos_mask.any(dim=1)
-    first_eos = torch.argmax(eos_mask.int(), dim=1)
-    full_length = torch.full_like(first_eos, input_ids.shape[1] - 1)
-    first_eos = torch.where(has_eos, first_eos, full_length)
-    return first_eos + 1
+def count_token_frequency(seqs: torch.Tensor, vocab_size: int) -> torch.Tensor:
+    flattened = seqs.reshape(-1)
+    flattened = flattened[flattened >= 0]
+    return torch.bincount(flattened, minlength=vocab_size)
 
 
-def iter_length_buckets(
-    input_ids: torch.Tensor,
-    eos_token_id: int,
-) -> Iterable[torch.Tensor]:
-    lengths = trim_lengths(input_ids, eos_token_id)
-    for length in torch.unique(lengths, sorted=True).tolist():
-        bucket = input_ids[lengths == length, :length]
-        if bucket.numel() > 0:
-            yield bucket.contiguous()
+def load_clone_schedule_function(spec: str):
+    if not spec:
+        raise ValueError(
+            "--clone_schedule_function is required when initializing checkpoint-0. "
+            "Pass a path:function_name that defines build_clone_schedule."
+        )
+    if ":" not in spec:
+        raise ValueError(
+            "--clone_schedule_function must look like path:function_name, "
+            f"got {spec!r}."
+        )
+
+    path_text, function_name = spec.rsplit(":", 1)
+    source_path = Path(path_text).expanduser()
+    if not source_path.exists():
+        raise FileNotFoundError(f"Clone schedule function path not found: {source_path}")
+
+    if source_path.suffix == ".ipynb":
+        with open(source_path, encoding="utf-8") as fin:
+            notebook = json.load(fin)
+        source_chunks = []
+        function_header = f"def {function_name}("
+        for cell in notebook.get("cells", []):
+            if cell.get("cell_type") != "code":
+                continue
+            source = "".join(cell.get("source", []))
+            if function_header in source:
+                source_chunks.append(source)
+        if not source_chunks:
+            raise ValueError(f"{function_name!r} was not found in {source_path}.")
+
+        namespace = {"torch": torch}
+        exec(compile("\n\n".join(source_chunks), str(source_path), "exec"), namespace)
+        schedule_function = namespace.get(function_name)
+    else:
+        module_spec = importlib.util.spec_from_file_location(
+            f"_custom_clone_schedule_{source_path.stem}",
+            source_path,
+        )
+        if module_spec is None or module_spec.loader is None:
+            raise ImportError(f"Could not import clone schedule module: {source_path}")
+        module = importlib.util.module_from_spec(module_spec)
+        module_spec.loader.exec_module(module)
+        schedule_function = getattr(module, function_name, None)
+
+    if not callable(schedule_function):
+        raise TypeError(f"{function_name!r} from {source_path} is not callable.")
+    return schedule_function
 
 
-def count_tokens_for_schedule(
-    input_ids: torch.Tensor,
+def call_clone_schedule_function(
+    schedule_function,
+    args: argparse.Namespace,
+    token_frequency: torch.Tensor,
     vocab_size: int,
     eos_token_id: int,
 ) -> torch.Tensor:
-    lengths = trim_lengths(input_ids, eos_token_id)
-    positions = torch.arange(input_ids.shape[1])[None, :]
-    valid = positions < lengths[:, None]
-    return torch.bincount(input_ids[valid], minlength=vocab_size)
+    kwargs = {
+        "token_frequency": token_frequency,
+        "vocab_size": vocab_size,
+        "eos_token_id": eos_token_id,
+        "args": args,
+    }
+    signature = inspect.signature(schedule_function)
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    )
+    if accepts_kwargs:
+        result = schedule_function(**kwargs)
+    else:
+        accepted_names = {
+            name
+            for name, param in signature.parameters.items()
+            if param.kind
+            in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+        }
+        result = schedule_function(
+            **{name: value for name, value in kwargs.items() if name in accepted_names}
+        )
+
+    clones_per_token = torch.as_tensor(result, dtype=torch.long)
+    if tuple(clones_per_token.shape) != (vocab_size,):
+        raise ValueError(
+            "Clone schedule function must return one clone count per token: "
+            f"expected shape ({vocab_size},), got {tuple(clones_per_token.shape)}."
+        )
+    if torch.any(clones_per_token <= 0):
+        raise ValueError("Clone schedule function must return positive clone counts.")
+    return clones_per_token
 
 
-def take_train_eval_subset(
-    data_path: str,
-    dataset: str,
-    sample_length: int | None,
-    size: int,
-    total_chunks: int,
+def summarize_clone_schedule(clones_per_token: torch.Tensor) -> str:
+    counts = torch.unique(clones_per_token, return_counts=True)
+    parts = [f"{int(clone_count)}x:{int(num_tokens)}" for clone_count, num_tokens in zip(*counts)]
+    hidden_states = int(clones_per_token.sum().item())
+    return f"hidden_states={hidden_states}, schedule=({', '.join(parts)})"
+
+
+def collect_pair_codes(
+    args: argparse.Namespace,
+    vocab_size: int,
 ) -> torch.Tensor:
-    chunk0 = load_sequences(chunk_file(data_path, dataset, 0, total_chunks), sample_length)
-    return chunk0[:size].clone()
+    pair_code_set: set[int] = set()
 
+    schedule_file = args.clone_schedule_file or f"{args.data_path}/{args.dataset}.lvd"
+    if Path(schedule_file).exists():
+        seqs = load_sequences(schedule_file, args.sample_length, mmap=not args.disable_mmap)
+        pair_code_set.update(collect_pair_codes_from_sequences(seqs, vocab_size).tolist())
 
-def evaluate_model(
-    model: CHMM,
-    input_ids: torch.Tensor,
-    batch_size: int,
-    eos_token_id: int,
-    max_batches: int | None = None,
-) -> dict[str, float]:
-    total_ll = 0.0
-    total_sequences = 0
-    total_tokens = 0
-    num_batches = 0
+    num_chunks = (
+        args.total_chunks
+        if args.pair_code_chunk_count <= 0
+        else min(args.pair_code_chunk_count, args.total_chunks)
+    )
 
-    with torch.no_grad():
-        for start in range(0, input_ids.shape[0], batch_size):
-            batch = input_ids[start : start + batch_size]
-            for bucket in iter_length_buckets(batch, eos_token_id):
-                ll, _ = model.forward_backward(bucket, return_messages=False)
-                total_ll += float(ll.sum().item())
-                total_sequences += int(bucket.shape[0])
-                total_tokens += int(bucket.numel())
-            num_batches += 1
-            if max_batches is not None and num_batches >= max_batches:
-                break
+    for chunk_idx in range(num_chunks):
+        path = chunk_file(args.data_path, args.dataset, chunk_idx, args.total_chunks)
+        seqs = load_sequences(path, args.sample_length, mmap=not args.disable_mmap)
+        pair_code_set.update(collect_pair_codes_from_sequences(seqs, vocab_size).tolist())
 
-    return {
-        "nll_per_sequence": -total_ll / max(total_sequences, 1),
-        "nll_per_token": -total_ll / max(total_tokens, 1),
-        "num_sequences": total_sequences,
-        "num_tokens": total_tokens,
-    }
+    if not pair_code_set:
+        raise ValueError("No observed token pairs were found to initialize sparse CHMM blocks.")
 
-
-def estimate_memory_gib(model: CHMM) -> dict[str, float]:
-    dtype_size = torch.tensor([], dtype=model.token_log_probs.dtype).element_size()
-    token_table = model.hidden_states * model.vocab_size * dtype_size / (1024 ** 3)
-    token_counts = model.hidden_states * model.vocab_size * 4 / (1024 ** 3)
-    clone_table = model.clone_log_probs.numel() * dtype_size / (1024 ** 3)
-    clone_counts = model.clone_log_probs.numel() * 4 / (1024 ** 3)
-    return {
-        "token_table_gib": token_table,
-        "token_counts_gib": token_counts,
-        "clone_table_gib": clone_table,
-        "clone_counts_gib": clone_counts,
-    }
+    return torch.tensor(sorted(pair_code_set), dtype=torch.long)
 
 
 def initialize_checkpoint_zero(
     args: argparse.Namespace,
     vocab_size: int,
     eos_token_id: int,
-    device: torch.device,
 ) -> CHMM:
-    print("Initializing checkpoint-0...")
+    schedule_file = args.clone_schedule_file or f"{args.data_path}/{args.dataset}.lvd"
+    if not Path(schedule_file).exists():
+        raise FileNotFoundError(
+            f"Clone schedule file not found: {schedule_file}. "
+            "Generate sampled LVD sequences first or pass --clone_schedule_file."
+        )
 
-    init_chunk_count = min(args.init_chunk_count, args.total_chunks)
-    token_frequency = torch.zeros(vocab_size, dtype=torch.long)
-
-    for chunk_id in range(init_chunk_count):
-        path = chunk_file(args.data_path, args.dataset, chunk_id, args.total_chunks)
-        seqs = load_sequences(path, args.sample_length)
-        token_frequency += count_tokens_for_schedule(seqs, vocab_size, eos_token_id)
-
-    ranked_tokens = rank_tokens_from_counts(
-        token_frequency,
-        protected_token_ids=[eos_token_id],
-    )
-    clones_per_token = build_clone_schedule(
+    print(f"load_sequences")
+    seqs = load_sequences(schedule_file, args.sample_length, mmap=not args.disable_mmap)
+    print(f"count_token_frequency")
+    token_frequency = count_token_frequency(seqs, vocab_size)
+    print(f"build_clone_schedule")
+    schedule_function = load_clone_schedule_function(args.clone_schedule_function)
+    clones_per_token = call_clone_schedule_function(
+        schedule_function=schedule_function,
+        args=args,
+        token_frequency=token_frequency,
         vocab_size=vocab_size,
-        ranked_token_ids=ranked_tokens,
-        four_clone_tokens=args.clone_top4,
-        two_clone_tokens=args.clone_top2,
-        protected_token_ids=[eos_token_id],
+        eos_token_id=eos_token_id,
     )
+    print(f"collect_pair_codes")
+    pair_codes = collect_pair_codes(args, vocab_size)
 
+    print(f"init model")
     model = CHMM(
         vocab_size=vocab_size,
         eos_token_id=eos_token_id,
         clones_per_token=clones_per_token,
-        storage_dtype=args.storage_dtype,
-        device=device,
+        pair_codes=pair_codes,
     )
 
-    memory = estimate_memory_gib(model)
-    print(
-        f"CHMM states={model.hidden_states}, max_clones={model.max_clones}, "
-        f"token_table={memory['token_table_gib']:.2f} GiB, "
-        f"token_counts={memory['token_counts_gib']:.2f} GiB"
-    )
-
-    token_counts, clone_counts, initial_counts = model.empty_count_buffers(device=device)
-
-    for chunk_id in range(init_chunk_count):
-        path = chunk_file(args.data_path, args.dataset, chunk_id, args.total_chunks)
-        seqs = load_sequences(path, args.sample_length)
-
-        for start in tqdm(
-            range(0, seqs.shape[0], args.batch_size),
-            desc=f"init chunk {chunk_id}",
-        ):
-            batch = seqs[start : start + args.batch_size]
-            for bucket in iter_length_buckets(batch, eos_token_id):
-                model.accumulate_hard_counts(
-                    bucket,
-                    token_counts,
-                    clone_counts,
-                    initial_counts,
-                    context_mode=args.init_context,
-                )
-
-    model.update_from_counts(
-        token_counts=token_counts,
-        clone_counts=clone_counts,
-        initial_counts=initial_counts,
-        pseudocount=args.pseudocount,
-        clone_pseudocount=args.clone_pseudocount,
-        initial_pseudocount=args.initial_pseudocount,
-        row_chunk_size=args.row_chunk_size,
-    )
-
+    print(f"save_pretrained")
     ckpt_dir = Path(args.model_path) / "checkpoint-0"
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
     model.save_pretrained(ckpt_dir)
-    print(f"Saved checkpoint-0 to {ckpt_dir}")
+
+    print(f"!!Initialized CHMM checkpoint-0 from {schedule_file}!!")
+    print(summarize_clone_schedule(clones_per_token))
+    print(f"observed_pair_blocks={int(pair_codes.numel())}")
+
     return model
 
 
-def expectation_step(
-    model: CHMM,
-    chunk_paths: list[str],
+def maybe_initialize_checkpoint_zero(
     args: argparse.Namespace,
+    rank: int,
+    vocab_size: int,
     eos_token_id: int,
-) -> tuple[tuple[torch.Tensor, torch.Tensor, torch.Tensor], dict[str, float]]:
-    token_counts, clone_counts, initial_counts = model.empty_count_buffers(device=model.device)
+) -> CHMM | None:
+    ckpt_dir = Path(args.model_path) / f"checkpoint-{args.checkpoint}"
+    if ckpt_dir.exists():
+        dist_barrier()
+        return None
 
-    total_ll = 0.0
-    total_sequences = 0
-    total_tokens = 0
-    seen_batches = 0
+    if args.checkpoint != 0:
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_dir}")
 
-    for path in chunk_paths:
-        seqs = load_sequences(path, args.sample_length)
-        for start in tqdm(range(0, seqs.shape[0], args.batch_size), desc=f"em {Path(path).name}"):
-            batch = seqs[start : start + args.batch_size]
-            for bucket in iter_length_buckets(batch, eos_token_id):
-                ll = model.accumulate_expected_counts(
-                    bucket,
-                    token_counts,
-                    clone_counts,
-                    initial_counts,
-                )
-                total_ll += float(ll.sum().item())
-                total_sequences += int(bucket.shape[0])
-                total_tokens += int(bucket.numel())
-            seen_batches += 1
-            if args.max_train_batches is not None and seen_batches >= args.max_train_batches:
-                break
-        if args.max_train_batches is not None and seen_batches >= args.max_train_batches:
-            break
+    model = None
+    if rank == 0:
+        model = initialize_checkpoint_zero(args, vocab_size, eos_token_id)
 
-    return (token_counts, clone_counts, initial_counts), {
-        "nll_per_sequence": -total_ll / max(total_sequences, 1),
-        "nll_per_token": -total_ll / max(total_tokens, 1),
-        "num_sequences": total_sequences,
-        "num_tokens": total_tokens,
+    dist_barrier()
+    return model
+
+
+def configure_runtime(
+    args: argparse.Namespace,
+    device: torch.device,
+) -> dict[str, object]:
+    runtime: dict[str, object] = {
+        "use_cuda": device.type == "cuda",
+        "pin_memory": False,
+        "non_blocking": False,
+        "use_mmap_load": not args.disable_mmap,
+        "allow_tf32": False,
+        "gpu_name": "",
+        "gpu_memory_gb": 0.0,
+        "capability": None,
     }
 
+    if device.type != "cuda":
+        return runtime
 
-def main() -> None:
-    args = parse_args()
-    os.makedirs(args.model_path, exist_ok=True)
+    props = torch.cuda.get_device_properties(device)
+    capability = torch.cuda.get_device_capability(device)
+    runtime["gpu_name"] = props.name
+    runtime["gpu_memory_gb"] = props.total_memory / (1024 ** 3)
+    runtime["capability"] = capability
 
-    if args.log_file:
-        os.makedirs(str(Path(args.log_file).parent), exist_ok=True)
-        with open(args.log_file, "a+", encoding="utf-8") as fout:
-            fout.write(json.dumps(vars(args), sort_keys=True) + "\n")
+    if not args.disable_pin_memory:
+        runtime["pin_memory"] = True
+        runtime["non_blocking"] = True
+
+    is_ampere_or_newer = capability[0] >= 8
+    if is_ampere_or_newer and not args.disable_tf32:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        try:
+            torch.set_float32_matmul_precision("high")
+        except AttributeError:
+            pass
+        runtime["allow_tf32"] = True
+
+    return runtime
+
+
+def move_batch_to_device(
+    cpu_batch: torch.Tensor,
+    device: torch.device,
+    runtime: dict[str, object],
+) -> torch.Tensor:
+    if device.type != "cuda":
+        return cpu_batch
+
+    batch = cpu_batch
+    if runtime["pin_memory"]:
+        batch = batch.pin_memory()
+    return batch.to(device, non_blocking=bool(runtime["non_blocking"]))
+
+
+def gather_train_eval_subset(
+    eval_parts: list[torch.Tensor],
+    target_rows: int,
+    local_chunk: torch.Tensor,
+) -> int:
+    current_rows = sum(part.shape[0] for part in eval_parts)
+    if current_rows >= target_rows:
+        return current_rows
+
+    take = min(target_rows - current_rows, local_chunk.shape[0])
+    if take > 0:
+        eval_parts.append(local_chunk[:take].clone())
+
+    return current_rows + take
+
+
+def train_chmm(
+    rank: int,
+    world_size: int,
+    args: argparse.Namespace,
+) -> None:
+    print("----started-----")
+    use_cuda = torch.cuda.is_available()
+    device = torch.device(f"cuda:{rank}" if use_cuda else "cpu")
+    runtime = configure_runtime(args, device)
 
     vocab_size, eos_token_id = resolve_vocab_and_eos(args)
-    schedule = parse_em_schedule(args.em_schedule, args.total_chunks)
-    if not 0.0 <= args.online_count_decay < 1.0:
-        raise ValueError("--online_count_decay must be in [0, 1).")
+    model = maybe_initialize_checkpoint_zero(args, rank, vocab_size, eos_token_id)
 
-    if args.device == "cuda" and not torch.cuda.is_available():
-        raise RuntimeError("CUDA was requested but is not available.")
-    device = torch.device(args.device)
-
-    checkpoint_dir = Path(args.model_path) / f"checkpoint-{args.checkpoint}"
-    if checkpoint_dir.exists():
-        model = CHMM.from_pretrained(checkpoint_dir, map_location=device)
-    else:
-        if args.checkpoint != 0:
-            raise FileNotFoundError(f"Checkpoint not found: {checkpoint_dir}")
-        model = initialize_checkpoint_zero(args, vocab_size, eos_token_id, device)
-
-    model = model.to(device)
-    if args.init_only:
-        return
-
-    dev_path = args.dev_file or f"{args.data_path}/{args.dataset}.dev"
-    dev_data = load_sequences(dev_path, args.sample_length)
-    train_eval = take_train_eval_subset(
-        args.data_path,
-        args.dataset,
-        args.sample_length,
-        args.train_eval_size,
-        args.total_chunks,
-    )
-
-    if args.online_count_decay > 0.0 and args.checkpoint != 0:
-        print(
-            "Warning: online_count_decay resumes EMA counts from the current checkpoint "
-            "parameters only; historical count buffers are not restored."
+    if model is None:
+        model = CHMM.from_pretrained(
+            Path(args.model_path) / f"checkpoint-{args.checkpoint}",
+            map_location="cpu",
         )
 
+    model = model.to(device)
+    model.eval()
+
+    if rank == 0:
+        if device.type == "cuda":
+            print(
+                "Runtime config: "
+                f"gpu={runtime['gpu_name']}, "
+                f"memory_gb={runtime['gpu_memory_gb']:.2f}, "
+                f"capability={runtime['capability']}, "
+                f"pin_memory={runtime['pin_memory']}, "
+                f"non_blocking={runtime['non_blocking']}, "
+                f"use_mmap_load={runtime['use_mmap_load']}, "
+                f"allow_tf32={runtime['allow_tf32']}"
+            )
+        else:
+            print(
+                "Runtime config: "
+                f"cpu_only, "
+                f"use_mmap_load={runtime['use_mmap_load']}"
+            )
+
+    dev_all = load_sequences(
+        f"{args.data_path}/{args.dataset}.dev",
+        args.sample_length,
+        mmap=bool(runtime["use_mmap_load"]),
+    )
+    dev_size = int(dev_all.shape[0])
+    dev_data = shard_rows(dev_all, rank, world_size)
+
+    em_schedule = parse_em_schedule(args.em_schedule)
+    for _, step_size in em_schedule:
+        if step_size > args.total_chunks:
+            raise ValueError("Each EM schedule step_size must be <= total_chunks.")
+
     step_offset = args.checkpoint
-    ema_token_counts: torch.Tensor | None = None
-    ema_clone_counts: torch.Tensor | None = None
-    ema_initial_counts: torch.Tensor | None = None
 
-    for step_count, step_size in schedule:
+    for step_count, step_size in em_schedule:
         for _ in range(step_count):
-            started = time.time()
-            chunk_paths = [
-                chunk_file(args.data_path, args.dataset, idx % args.total_chunks, args.total_chunks)
-                for idx in range(step_offset, step_offset + step_size)
-            ]
+            if step_offset == args.checkpoint:
+                with torch.inference_mode():
+                    dev_ll = compute_loglikelihood(model, dev_data, args.batch_size)
+                dist_all_reduce(dev_ll)
 
-            (step_token_counts, step_clone_counts, step_initial_counts), train_metrics = expectation_step(
-                model,
-                chunk_paths,
-                args,
-                eos_token_id,
-            )
+                if rank == 0:
+                    msg = f"{args.checkpoint}\t{-1.0}\t{dev_ll.item() / max(dev_size, 1)}"
+                    print(msg)
+                    if args.log_file:
+                        with open(args.log_file, "a+", encoding="utf-8") as fout:
+                            fout.write(msg + "\n")
 
-            if args.online_count_decay > 0.0:
-                if ema_token_counts is None:
-                    ema_token_counts = step_token_counts
-                    ema_clone_counts = step_clone_counts
-                    ema_initial_counts = step_initial_counts
+            transition_counts, gamma_counts = model.empty_count_buffers(device=device)
+            train_eval_parts: list[torch.Tensor] = []
+            train_eval_target_rows = int(dev_data.shape[0])
+
+            with torch.inference_mode():
+                for idx in range(step_offset, step_offset + step_size):
+                    path = chunk_file(
+                        args.data_path,
+                        args.dataset,
+                        idx % args.total_chunks,
+                        args.total_chunks,
+                    )
+                    local_chunk = load_sequences(
+                        path,
+                        args.sample_length,
+                        mmap=bool(runtime["use_mmap_load"]),
+                    )
+                    local_chunk = shard_rows(local_chunk, rank, world_size)
+
+                    if local_chunk.shape[0] == 0:
+                        continue
+                    chunk_fully_observed = args.dropout <= 0.0 and not torch.any(local_chunk == -1)
+
+                    gather_train_eval_subset(
+                        train_eval_parts,
+                        train_eval_target_rows,
+                        local_chunk,
+                    )
+
+                    for batch_idx in tqdm(
+                        range(0, local_chunk.shape[0], args.batch_size),
+                        disable=rank != 0,
+                    ):
+                        cpu_batch = local_chunk[batch_idx : batch_idx + args.batch_size]
+                        batch = move_batch_to_device(cpu_batch, device, runtime)
+                        batch = apply_dropout(batch, args.dropout, vocab_size, eos_token_id)
+
+                        if chunk_fully_observed or not torch.any(batch == -1):
+                            model.accumulate_observed(batch, transition_counts, gamma_counts)
+                        else:
+                            probs = model.forward(batch)
+                            model.backward(batch, probs, transition_counts, None, gamma_counts)
+
+            dist_all_reduce(transition_counts)
+            dist_all_reduce(gamma_counts)
+
+            with torch.inference_mode():
+                model.update_from_counts(
+                    transition_counts=transition_counts,
+                    gamma_counts=gamma_counts,
+                    pseudocount=args.pseudocount,
+                )
+
+                if train_eval_parts:
+                    train_data_eval = torch.cat(train_eval_parts, dim=0)
                 else:
-                    decay = args.online_count_decay
-                    keep = 1.0 - decay
-                    ema_token_counts.mul_(decay).add_(step_token_counts, alpha=keep)
-                    ema_clone_counts.mul_(decay).add_(step_clone_counts, alpha=keep)
-                    ema_initial_counts.mul_(decay).add_(step_initial_counts, alpha=keep)
+                    train_data_eval = dev_data[:0].clone()
 
-                token_counts = ema_token_counts
-                clone_counts = ema_clone_counts
-                initial_counts = ema_initial_counts
-            else:
-                token_counts = step_token_counts
-                clone_counts = step_clone_counts
-                initial_counts = step_initial_counts
+                train_ll = compute_loglikelihood(model, train_data_eval, args.batch_size)
+                dev_ll = compute_loglikelihood(model, dev_data, args.batch_size)
 
-            model.update_from_counts(
-                token_counts=token_counts,
-                clone_counts=clone_counts,
-                initial_counts=initial_counts,
-                pseudocount=args.pseudocount,
-                clone_pseudocount=args.clone_pseudocount,
-                initial_pseudocount=args.initial_pseudocount,
-                row_chunk_size=args.row_chunk_size,
-            )
+            dist_all_reduce(train_ll)
+            dist_all_reduce(dev_ll)
 
-            dev_metrics = evaluate_model(
-                model,
-                dev_data,
-                args.batch_size,
-                eos_token_id,
-                max_batches=args.max_dev_batches,
-            )
-            train_eval_metrics = evaluate_model(
-                model,
-                train_eval,
-                args.batch_size,
-                eos_token_id,
-                max_batches=args.max_dev_batches,
-            )
+            if rank == 0:
+                ckpt = step_offset + step_size
+                msg = f"{ckpt}\t{train_ll.item() / max(dev_size, 1)}\t{dev_ll.item() / max(dev_size, 1)}"
+                print(msg)
+                if args.log_file:
+                    with open(args.log_file, "a+", encoding="utf-8") as fout:
+                        fout.write(msg + "\n")
 
-            ckpt = step_offset + step_size
-            elapsed = time.time() - started
-            msg = (
-                f"ckpt={ckpt}\t"
-                f"train_step_nll_tok={train_metrics['nll_per_token']:.6f}\t"
-                f"train_eval_nll_tok={train_eval_metrics['nll_per_token']:.6f}\t"
-                f"dev_nll_tok={dev_metrics['nll_per_token']:.6f}\t"
-                f"elapsed_s={elapsed:.1f}"
-            )
-            print(msg)
-            if args.log_file:
-                with open(args.log_file, "a+", encoding="utf-8") as fout:
-                    fout.write(msg + "\n")
-
-            if ckpt % args.save_per_step == 0:
-                out_dir = Path(args.model_path) / f"checkpoint-{ckpt}"
-                model.save_pretrained(out_dir)
+                if ckpt % args.save_per_step == 0 and ckpt != 0:
+                    model.save_pretrained(Path(args.model_path) / f"checkpoint-{ckpt}")
 
             step_offset += step_size
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    rank = int(os.environ.get("RANK", str(local_rank)))
+
+    if world_size > 1:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend)
+
+    Path(args.model_path).mkdir(parents=True, exist_ok=True)
+
+    if rank == 0 and args.log_file:
+        log_path = Path(args.log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a+", encoding="utf-8") as fout:
+            fout.write(str(vars(args)) + "\n")
+
+    train_chmm(rank, world_size, args)
